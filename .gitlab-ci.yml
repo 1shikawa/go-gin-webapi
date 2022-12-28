@@ -1,0 +1,127 @@
+image: docker:19.03.13
+
+services:
+  - name: docker:19.03.13-dind
+
+variables:
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+  PERSONAL_ACCESS_TOKEN: ${PERSONAL_ACCESS_TOKEN} #GitLab CI/CD Settings Variables
+
+stages:
+  - lint
+  - test
+  - build_and_scan
+  - build_and_push
+  - update_manifest
+  - open_merge_request
+
+lint:
+  stage: lint
+  # before_script:
+  #   - env | grep golangci
+  #   - golangci-lint --help
+  image:
+    name: golangci/golangci-lint:latest-alpine
+    entrypoint: [""]
+  script:
+    - golangci-lint run -v
+
+test:
+  stage: test
+  # before_script:
+  #   - env | grep go
+  image:
+    name: docker.io/library/golang
+    entrypoint: [""]
+  script:
+    - go install -v
+    - go test -v ./tests
+
+build_and_scan:
+  stage: build_and_scan
+  # before_script:
+  #   - env | grep DOCKER
+  variables:
+    ECR_HOST: 949993607219.dkr.ecr.ap-northeast-1.amazonaws.com
+    IMAGE_NAME: cicd-dev
+  script:
+    - docker build --target prod -t ${IMAGE_NAME}:${CI_COMMIT_SHA} .
+    - docker images
+    - |
+      docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image \
+        --exit-code 0 --severity HIGH,CRITICAL --timeout=30m \
+        ${IMAGE_NAME}:${CI_COMMIT_SHA}
+
+build_and_push:
+  stage: build_and_push
+  # before_script:
+  #   - env | grep kaniko
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  variables:
+    ECR_HOST: 949993607219.dkr.ecr.ap-northeast-1.amazonaws.com
+    IMAGE_NAME: cicd-dev
+  script:
+    - |
+      cat > /kaniko/.docker/config.json <<EOF
+      {
+        "credsStore": "ecr-login"
+      }
+      EOF
+    - echo ${CI_PROJECT_DIR}
+    - |
+      /kaniko/executor \
+        --registry-mirror="mirror.gcr.io" \
+        --context ${CI_PROJECT_DIR} \
+        --dockerfile ${CI_PROJECT_DIR}/Dockerfile \
+        --target prod \
+        --destination ${ECR_HOST}/${IMAGE_NAME}:${CI_COMMIT_SHA}
+
+update_manifest:
+  stage: update_manifest
+  image: mikefarah/yq:3.3.4
+  variables:
+    GIT_STRATEGY: none
+    CD_GIT_REPOSITORY: https://oauth2:${PERSONAL_ACCESS_TOKEN}@gitlab.opencanvasatelier.com/com001/infrastructure/aws/kubernetes/manifest.git  # manifestリポジトリ
+    CD_MANIFEST_REPO: manifest/base  # manifestディレクトリ
+    CD_MANIFEST_FILE: kustomization.yaml  # image tag書き換え対象のmanifestファイル名
+    BRANCH_NAME: ${CI_PROJECT_NAME}/Pipeline#${CI_PIPELINE_ID}
+    ECR_HOST: 949993607219.dkr.ecr.ap-northeast-1.amazonaws.com
+    IMAGE_NAME: cicd-dev
+  retry: 2
+  script:
+    - apk add --no-cache git
+    - git config --global user.name ${CI_PROJECT_NAME}
+    - git config --global user.email ${CI_PROJECT_NAME}"@gitlab.com"
+    - git clone --single-branch --branch master ${CD_GIT_REPOSITORY}
+    - cd ${CD_MANIFEST_REPO}
+    - git checkout -b ${BRANCH_NAME}
+    - yq write -i ${CD_MANIFEST_FILE} images[0].newTag ${CI_COMMIT_SHA}
+    - cat $CD_MANIFEST_FILE
+    - git commit -am "Update image tag" && git push -u origin ${BRANCH_NAME}
+  only:
+    - master
+
+open_merge_request:
+  stage: open_merge_request
+  image: registry.gitlab.com/gitlab-automation-toolkit/gitlab-auto-mr
+  variables:
+    GIT_STRATEGY: none
+    BRANCH_NAME: ${CI_PROJECT_NAME}/Pipeline#${CI_PIPELINE_ID}
+    CD_PROJECT_ID: 139 # manifestレポジトリID(GitLabのプロジェクトID)
+  script:
+    - |
+      gitlab_auto_mr \
+      --private-token ${PERSONAL_ACCESS_TOKEN} \
+      --source-branch ${BRANCH_NAME} \
+      --project-id ${CD_PROJECT_ID} \
+      --target-branch master \
+      --commit-prefix WIP \
+      --remove-branch \
+      --squash-commits \
+      --title "Update image tag by ${BRANCH_NAME}"
+  only:
+    - master
+
